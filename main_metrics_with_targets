@@ -1,0 +1,244 @@
+-- ============================================================
+-- Merged efficiency query — daily grain
+--
+-- Each row = one city × one calendar day.
+-- Time columns (report_date / week_date / month_date) let the
+-- consumer aggregate to any period without re-running the query.
+-- Geography columns (city_code … global) let the consumer group
+-- to any geo level without GROUPING SETS.
+--
+-- Date windows included:
+--   • Recent monthly  : last 6 months
+--   • Weekly          : last 8 complete weeks  (subset of above)
+--   • Historical YoY  : 12-16 months ago
+--
+-- Targets are joined at every geography level so the consumer
+-- can compare actuals vs targets at whichever level they roll up to.
+-- Update the CASE WHEN target_type = '...' list to match the
+-- actual values in your targets table.
+-- ============================================================
+
+WITH
+
+-- ── 1. Geography dimension ───────────────────────────────────
+geography AS (
+  SELECT
+    city_code,
+    city_size,
+    country_code,
+    country_subregion,
+    CASE
+      WHEN country_code IN ('ES','PT')                               THEN 'IBERIA'
+      WHEN country_code IN ('IT','RO','HR','RS','BG','BA','MD','ME') THEN 'ITSEE'
+      WHEN country_code IN ('PL','UA','GE','KZ','KG','AM')           THEN 'PLECA'
+      WHEN country_code IN ('MA','TN','KE','NG','CI','UG')           THEN 'AFRICA'
+      ELSE NULL
+    END AS global_region,
+    CASE
+      WHEN country_code IN ('RO','HR','RS','BG','BA','MD','ME') THEN 'SEE'
+      WHEN country_code IN ('UA','GE','KZ','KG','AM')           THEN 'ECA'
+      ELSE NULL
+    END AS global_old_region,
+    CASE WHEN country_code NOT IN ('ES')           THEN 'GLOBAL Wo ES'          ELSE NULL END AS global_wo_es,
+    CASE WHEN country_code NOT IN ('PT','IT')      THEN 'GLOBAL Wo FLEX'        ELSE NULL END AS global_wo_flex,
+    CASE WHEN country_code NOT IN ('ES','PT','IT') THEN 'GLOBAL Wo ES, PT & IT' ELSE NULL END AS global_wo_es_pt_it,
+    'GLOBAL' AS global
+  FROM `fulfillment-dwh-production.curated_data_shared_glovo.geography__cities_v2`
+),
+
+-- ── 2. Daily metrics — single scan, 16-month window ─────────
+daily_base AS (
+  SELECT
+    utr.city_code,
+    utr.p_report_date,
+    utr.total_orders                          AS utr_n,
+    utr.working_hours                         AS utr_d,
+    rc.total_costs_local_currency             AS cpo_lc_n,
+    rc.total_costs_eur                        AS cpo_eur_n,
+    rc.total_bad_weather_cost_local_currency  AS bwb_lc_n,
+    rc.total_bad_weather_cost_eur             AS bwb_eur_n,
+    rc.order_count                            AS cpo_d,
+    dt.dt_glovo_n,
+    dt.dt_glovo_d,
+    dt.dt_glovo_food_n,
+    dt.dt_glovo_food_over_60_n,
+    dt.dt_glovo_food_d,
+    dt.dt_glovo_groceries_n,
+    dt.dt_glovo_groceries_d
+  FROM `fulfillment-dwh-production.curated_data_shared_glovo.efficiency__utr` utr
+  LEFT JOIN `fulfillment-dwh-production.curated_data_shared_glovo.rider_compensations__payments_city_day_level` rc
+    ON rc.city_code     = utr.city_code
+   AND rc.p_report_date = utr.p_report_date
+  LEFT JOIN `fulfillment-dwh-production.curated_data_shared_glovo.delivery_times__delivery_times` dt
+    ON dt.city_code     = utr.city_code
+   AND dt.p_report_date = utr.p_report_date
+  WHERE utr.p_report_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 16 MONTH)
+),
+
+-- ── 3. Fail Rate — daily city level ─────────────────────────
+fr_daily AS (
+  SELECT
+    city_code,
+    p_created_date                                                       AS report_date,
+    COUNT(DISTINCT CASE WHEN is_cancelled_order_15min THEN order_id END) AS fr_n,
+    COUNT(DISTINCT order_id)                                             AS fr_d
+  FROM `fulfillment-dwh-production.curated_data_shared_glovo.fail_rate__order_details`
+  WHERE p_created_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 16 MONTH)
+  GROUP BY 1, 2
+),
+
+-- ── 4. Bad Weather Flag — daily city level ───────────────────
+--      Historical window (12-16m) excluded: bw bonus data not available.
+bw_daily AS (
+  SELECT
+    city_code,
+    p_creation_date                                                      AS report_date,
+    COUNT(DISTINCT IF(
+      (  other_bad_weather_bonus_cost_local_currency
+       + bad_weather_bonus_cost_local_currency
+       + snow_bonus_cost_local_currency
+       + rain_bonus_cost_local_currency) > 0,
+      order_id, NULL))                                                   AS bw_n,
+    COUNT(DISTINCT order_id)                                             AS bw_d
+  FROM `fulfillment-dwh-production.curated_data_shared_glovo.rider_compensations__payments_order_level`
+  WHERE order_final_status <> 'CanceledStatus'
+    AND p_creation_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 6 MONTH)
+  GROUP BY 1, 2
+),
+
+-- ── 5. Targets — pivoted by target_type, keyed by geo level ──
+--      geography_level matches: 'city', 'country_code',
+--      'country_subregion', 'global_region', 'global_old_region', 'global'
+--      ⚠ Update the CASE WHEN values to match your actual target_type strings.
+targets AS (
+  SELECT
+    geography_level,
+    geography,
+    month_date,
+    MAX(CASE WHEN target_type = 'eff_target'        THEN target END) AS target_utr,
+    MAX(CASE WHEN target_type = 'dt_food_target'    THEN target END) AS target_dt_food,
+    MAX(CASE WHEN target_type = 'dt_target' THEN target END) AS target_dt_grocery,
+    MAX(CASE WHEN target_type = 'hc_target'         THEN target END) AS target_fr,
+    MAX(CASE WHEN target_type = 'cpo_target'    THEN target END) AS target_cpo_eur
+  FROM `fulfillment-dwh-production.curated_data_shared_glovo.global_supply_ops__supply_ops_targets`
+  WHERE month_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 2 MONTH)
+    AND month_date <  DATE_ADD(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 2 MONTH)
+  GROUP BY 1, 2, 3
+),
+
+final  AS (SELECT
+
+  -- ── Time dimensions ──────────────────────────────────────
+  db.p_report_date                                 AS report_date,
+  DATE_TRUNC(db.p_report_date, WEEK(MONDAY))       AS week_date,
+  DATE_TRUNC(db.p_report_date, MONTH)              AS month_date,
+
+  -- ── Geography dimensions (all levels as flat columns) ────
+  g.city_code,
+  g.city_size,
+  g.country_code,
+  g.country_subregion,
+  g.global_region,
+  g.global_old_region,
+  g.global_wo_es,
+  g.global_wo_flex,
+  g.global_wo_es_pt_it,
+  g.global,
+
+  -- ── Daily metrics ─────────────────────────────────────────
+  db.utr_n,
+  db.utr_d,
+  db.cpo_lc_n,
+  db.cpo_eur_n,
+  db.bwb_lc_n,
+  db.bwb_eur_n,
+  db.cpo_d,
+  db.dt_glovo_n,
+  db.dt_glovo_d,
+  db.dt_glovo_food_n,
+  db.dt_glovo_food_over_60_n,
+  db.dt_glovo_food_d,
+  db.dt_glovo_groceries_n,
+  db.dt_glovo_groceries_d,
+  fr.fr_n,
+  fr.fr_d,
+  bw.bw_n,
+  bw.bw_d,
+
+  -- ── Targets by geography level ────────────────────────────
+  -- City-level targets
+  t_city.target_utr         AS city_target_utr,
+  t_city.target_dt_food     AS city_target_dt_food,
+  t_city.target_dt_grocery  AS city_target_dt_grocery,
+  t_city.target_fr          AS city_target_fr,
+  t_city.target_cpo_eur     AS city_target_cpo,
+
+  -- Country-level targets
+  t_country.target_utr         AS country_target_utr,
+  t_country.target_dt_food     AS country_target_dt_food,
+  t_country.target_dt_grocery  AS country_target_dt_grocery,
+  t_country.target_fr          AS country_target_fr,
+  t_country.target_cpo_eur     AS country_target_cpo,
+
+  -- Global region-level targets
+  t_region.target_utr         AS global_region_target_utr,
+  t_region.target_dt_food     AS global_region_target_dt_food,
+  t_region.target_dt_grocery  AS global_region_target_dt_grocery,
+  t_region.target_fr          AS global_region_target_fr,
+  t_region.target_cpo_eur     AS global_region_target_cpo,
+
+  -- Global (all) targets
+  t_global.target_utr         AS global_target_utr,
+  t_global.target_dt_food     AS global_target_dt_food,
+  t_global.target_dt_grocery  AS global_target_dt_grocery,
+  t_global.target_fr          AS global_target_fr,
+  t_global.target_cpo_eur     AS global_target_cpo
+
+FROM daily_base db
+
+LEFT JOIN geography g
+  ON g.city_code = db.city_code
+
+LEFT JOIN fr_daily fr
+  ON fr.city_code   = db.city_code
+ AND fr.report_date = db.p_report_date
+
+LEFT JOIN bw_daily bw
+  ON bw.city_code   = db.city_code
+ AND bw.report_date = db.p_report_date
+
+-- Targets: one join per geography level, all matched to the month of the row
+LEFT JOIN targets t_city
+  ON t_city.geography_level = 'city'
+ AND t_city.geography       = g.city_code
+ AND t_city.month_date      = DATE_TRUNC(db.p_report_date, MONTH)
+
+LEFT JOIN targets t_country
+  ON t_country.geography_level = 'country'
+ AND t_country.geography       = g.country_code
+ AND t_country.month_date      = DATE_TRUNC(db.p_report_date, MONTH)
+
+LEFT JOIN targets t_region
+  ON t_region.geography_level = 'global_region'
+ AND t_region.geography       = g.global_region
+ AND t_region.month_date      = DATE_TRUNC(db.p_report_date, MONTH)
+
+LEFT JOIN targets t_global
+  ON t_global.geography_level = 'global'
+ AND t_global.geography       = g.global
+ AND t_global.month_date      = DATE_TRUNC(db.p_report_date, MONTH)
+
+WHERE
+  -- Recent 6 months (covers both the monthly recent window and the 8-week window)
+  db.p_report_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 6 MONTH)
+  OR
+  -- Historical YoY window: 12-16 months ago
+  (    db.p_report_date >= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 16 MONTH)
+   AND db.p_report_date <= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 12 MONTH)
+  )
+  ORDER BY db.p_report_date, g.city_code
+)
+
+SELECT * FROM FINAL
+where week_date = date('2026-05-04')
+AND city_code = 'BAT'

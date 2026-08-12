@@ -1,0 +1,165 @@
+-- ============================================================
+-- ALL 22 COUNTRIES — DT60 BE (business estimate) conversion, i.e. the "V0"
+-- reading from the DT60 Targets Definition Methodology doc's Step 1,
+-- computed against a ROLLING LAST-30-DAYS window instead of the full
+-- 2026 year-to-date distribution.
+--
+-- METHOD (unchanged from the doc, just re-scoped to 30 days): for each
+-- country, r = BE_minutes / current_mean_delivery_time. Instead of
+-- rescaling every order by r, the threshold moves: an order breaches only
+-- if r * delivery_time > 60, i.e. delivery_time > 60/r. The BE target is
+-- the share of the country's own real order-level distribution (last 30
+-- days) sitting above that moved threshold. Setting BE = current mean
+-- gives r = 1, threshold = 60, and the formula collapses back to exactly
+-- today's DT60 -- calibration is guaranteed by construction, no separate
+-- check needed.
+--
+-- ONE DIFFERENCE FROM THE SPREADSHEET VERSION: the doc's version works
+-- from pre-aggregated 10-minute delivery-time buckets and interpolates
+-- within the bucket the new threshold falls into (see the gv-bg worked
+-- example: 2.84% of orders in the 60-70 bucket, threshold at 61.85 ->
+-- take 2.84 * (1.85/10) = 0.52% of that bucket as still-breaching). Here,
+-- BigQuery has the real per-order delivery_time_minutes value, so the
+-- share above the threshold is computed exactly, order by order --
+-- strictly more precise than bucket interpolation, same underlying
+-- method, no approximation error.
+--
+-- >>> EDIT BEFORE RUNNING: paste your monthly Food DT BE per country (in
+-- minutes) into the be_inputs temp table below, replacing the NULL
+-- placeholders. Any country left NULL will come back with a NULL target
+-- (SAFE_DIVIDE/NULL propagation, not an error) -- easy to spot in the
+-- output. <<<
+--
+-- Date range: DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY) through
+-- DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY) exclusive -- rolling, no manual
+-- date editing needed on re-run.
+-- ============================================================
+
+CREATE TEMP TABLE order_level_be_r30d AS (
+  SELECT
+    o.global_order_id AS order_id,
+    LOWER(o.country_code) AS country_code,
+    CASE
+      WHEN o.is_preorder = TRUE
+        THEN TIMESTAMP_DIFF(TIMESTAMP(o.rider_dropped_off_at), TIMESTAMP(o.order_queued_at), MINUTE)
+      ELSE (o.actual_delivery_time_in_seconds + COALESCE(o.at_customer_time_in_seconds, 0)) / 60.00
+    END AS delivery_time_minutes,
+    CASE
+      WHEN (
+        CASE
+          WHEN o.is_preorder = TRUE
+            THEN TIMESTAMP_DIFF(TIMESTAMP(o.rider_dropped_off_at), TIMESTAMP(o.order_queued_at), MINUTE)
+          ELSE (o.actual_delivery_time_in_seconds + COALESCE(o.at_customer_time_in_seconds, 0)) / 60.00
+        END > 60
+      ) AND o.vertical_type = 'restaurants' THEN 1
+      ELSE 0
+    END AS is_dt60
+  FROM `fulfillment-dwh-production.curated_data_shared_glovo.logistics_orders__orders` AS o
+  WHERE DATE(o.order_created_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND DATE(o.order_created_at) <  DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY)
+    AND LOWER(o.country_code) IN (
+      'gv-am','gv-ba','gv-bg','gv-ci','gv-es','gv-ge','gv-hr','gv-it','gv-ke','gv-kg',
+      'gv-kz','gv-ma','gv-md','gv-me','gv-ng','gv-pl','gv-pt','gv-ro','gv-rs','gv-tn',
+      'gv-ua','gv-ug'
+    )
+    AND o.order_status = 'completed'
+    AND o.vertical_type = 'restaurants'
+);
+
+-- >>> EDIT THIS: paste your monthly Food DT BE per country here, in minutes.
+CREATE TEMP TABLE be_inputs AS (
+  SELECT * FROM UNNEST([
+    STRUCT('gv-am' AS country_code, CAST(NULL AS FLOAT64) AS be_minutes),
+    STRUCT('gv-ba', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-bg', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ci', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-es', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ge', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-hr', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-it', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ke', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-kg', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-kz', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ma', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-md', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-me', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ng', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-pl', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-pt', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ro', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-rs', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-tn', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ua', CAST(NULL AS FLOAT64)),
+    STRUCT('gv-ug', CAST(NULL AS FLOAT64))
+  ])
+);
+
+CREATE TEMP TABLE country_stats_be_r30d AS (
+  SELECT
+    country_code,
+    COUNT(*) AS total_orders,
+    AVG(delivery_time_minutes) AS current_mean_minutes,
+    SAFE_DIVIDE(COUNTIF(is_dt60 = 1), COUNT(*)) * 100.0 AS dt60_actual_pct
+  FROM order_level_be_r30d
+  GROUP BY country_code
+);
+
+WITH ratios AS (
+  SELECT
+    s.country_code,
+    s.total_orders,
+    s.current_mean_minutes,
+    s.dt60_actual_pct,
+    b.be_minutes,
+    SAFE_DIVIDE(b.be_minutes, s.current_mean_minutes) AS scaling_ratio,
+    SAFE_DIVIDE(60.0, SAFE_DIVIDE(b.be_minutes, s.current_mean_minutes)) AS effective_threshold_minutes
+  FROM country_stats_be_r30d s
+  LEFT JOIN be_inputs b ON b.country_code = s.country_code
+),
+
+flagged AS (
+  SELECT
+    e.country_code,
+    (r.effective_threshold_minutes IS NOT NULL AND e.delivery_time_minutes > r.effective_threshold_minutes) AS is_above_effective_threshold
+  FROM order_level_be_r30d e
+  JOIN ratios r ON r.country_code = e.country_code
+),
+
+be_targets AS (
+  SELECT
+    country_code,
+    SAFE_DIVIDE(COUNTIF(is_above_effective_threshold), COUNT(*)) * 100.0 AS be_target_dt60_pct
+  FROM flagged
+  GROUP BY country_code
+)
+
+SELECT
+  r.country_code,
+  r.total_orders,
+  ROUND(r.current_mean_minutes, 2) AS current_mean_minutes,
+  r.be_minutes,
+  ROUND(r.scaling_ratio, 4) AS scaling_ratio,
+  ROUND(r.effective_threshold_minutes, 2) AS effective_threshold_minutes,
+  ROUND(r.dt60_actual_pct, 2) AS dt60_actual_pct,
+  ROUND(bt.be_target_dt60_pct, 2) AS be_target_dt60_pct,
+  ROUND(r.dt60_actual_pct - bt.be_target_dt60_pct, 2) AS improvement_pp
+FROM ratios r
+JOIN be_targets bt ON bt.country_code = r.country_code
+
+UNION ALL
+
+SELECT
+  'GLOBAL' AS country_code,
+  (SELECT COUNT(*) FROM order_level_be_r30d) AS total_orders,
+  ROUND((SELECT AVG(delivery_time_minutes) FROM order_level_be_r30d), 2) AS current_mean_minutes,
+  CAST(NULL AS FLOAT64) AS be_minutes,
+  CAST(NULL AS FLOAT64) AS scaling_ratio,
+  CAST(NULL AS FLOAT64) AS effective_threshold_minutes,
+  ROUND((SELECT SAFE_DIVIDE(COUNTIF(is_dt60 = 1), COUNT(*)) * 100.0 FROM order_level_be_r30d), 2) AS dt60_actual_pct,
+  ROUND((SELECT SAFE_DIVIDE(COUNTIF(is_above_effective_threshold), COUNT(*)) * 100.0 FROM flagged), 2) AS be_target_dt60_pct,
+  ROUND(
+    (SELECT SAFE_DIVIDE(COUNTIF(is_dt60 = 1), COUNT(*)) * 100.0 FROM order_level_be_r30d)
+    - (SELECT SAFE_DIVIDE(COUNTIF(is_above_effective_threshold), COUNT(*)) * 100.0 FROM flagged),
+  2) AS improvement_pp
+
+ORDER BY country_code;

@@ -1,0 +1,288 @@
+-- ============================================================
+-- ALL 22 COUNTRIES — "Revert back to 2025" DT60 target (the doc's Step 2
+-- reading), computed against a ROLLING LAST-30-DAYS window for the
+-- "current" side, compared against a FULL-YEAR-2025 baseline (per your
+-- answer: revert baseline = full-year 2025 average per leg, not a
+-- matched 30-day window a year ago -- same baseline convention used
+-- everywhere else in this project).
+--
+-- SCHEMA GAP -- READ BEFORE USING: the doc's methodology reverts SIX time
+-- legs (acceptance, prep, to-vendor, at-vendor, to-customer, hold-back).
+-- Every query built in this BigQuery project so far -- including this one
+-- -- has only ever had verified access to THREE of those six, via the
+-- vendor_northstar_metrics table: dispatch_to_pickup_time_minutes
+-- (labelled dispatch_to_pu elsewhere in this project; this is likely a
+-- bundle of acceptance + hold-back + to-vendor rather than a single one
+-- of the doc's six legs, but there's no column in this project's schema
+-- that isolates them further), wait_time_pickup_minutes (at-vendor), and
+-- to_customer_time_minutes (to-customer). Acceptance, prep, and hold-back
+-- as STANDALONE legs are not available anywhere this project has queried.
+-- This query reverts the 3 legs it can verify and is explicit about that
+-- in its column names (slip_dispatch_to_pu, not slip_acceptance) -- it is
+-- a narrower revert than the doc describes, not a substitute for it. If
+-- you have the source table that backs the doc's six-leg spreadsheet
+-- breakdown, send it over and this can be extended to match exactly.
+--
+-- METHOD: for each leg, slip = GREATEST(last_30_days_2026_avg -
+-- full_year_2025_avg, 0) -- only worsening counts, never negative (a leg
+-- that improved YoY contributes zero, we never make a leg "worse" to
+-- force the comparison). Total slip is removed from the current 30-day
+-- mean delivery time to get a reverted mean; that becomes a scaling ratio
+-- r = reverted_mean / current_mean, and (same threshold-shift trick as
+-- the BE conversion query) an order breaches only if delivery_time >
+-- 60/r. raw_reverted_dt60_pct is the share of the real last-30-days
+-- distribution above that moved threshold.
+--
+-- FLOOR: the raw reverted number can occasionally beat the country's real
+-- 2025 DT60, because it only removes slowdowns and never reverses real
+-- improvements -- so it's not a legitimate "what 2025 actually looked
+-- like" reading. Per the doc: floor it at the country's real 2025 DT60.
+-- reverted_target_dt60_pct = GREATEST(raw_reverted_dt60_pct,
+-- dt60_2025_actual_pct).
+--
+-- Date ranges: "current" = DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+-- through DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY) exclusive (rolling).
+-- "2025 baseline" = fixed, DATE('2025-01-01') through DATE('2026-01-01')
+-- exclusive (full calendar year, not rolling -- 2025 is a closed year).
+-- ============================================================
+
+CREATE TEMP TABLE order_level_current_r30d AS (
+  WITH orders_base AS (
+    SELECT
+      o.global_order_id AS order_id,
+      LOWER(o.country_code) AS country_code,
+      CASE
+        WHEN o.is_preorder = TRUE
+          THEN TIMESTAMP_DIFF(TIMESTAMP(o.rider_dropped_off_at), TIMESTAMP(o.order_queued_at), MINUTE)
+        ELSE (o.actual_delivery_time_in_seconds + COALESCE(o.at_customer_time_in_seconds, 0)) / 60.00
+      END AS delivery_time_minutes,
+      CASE
+        WHEN (
+          CASE
+            WHEN o.is_preorder = TRUE
+              THEN TIMESTAMP_DIFF(TIMESTAMP(o.rider_dropped_off_at), TIMESTAMP(o.order_queued_at), MINUTE)
+            ELSE (o.actual_delivery_time_in_seconds + COALESCE(o.at_customer_time_in_seconds, 0)) / 60.00
+          END > 60
+        ) AND o.vertical_type = 'restaurants' THEN 1
+        ELSE 0
+      END AS is_dt60
+    FROM `fulfillment-dwh-production.curated_data_shared_glovo.logistics_orders__orders` AS o
+    WHERE DATE(o.order_created_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+      AND DATE(o.order_created_at) <  DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY)
+      AND LOWER(o.country_code) IN (
+        'gv-am','gv-ba','gv-bg','gv-ci','gv-es','gv-ge','gv-hr','gv-it','gv-ke','gv-kg',
+        'gv-kz','gv-ma','gv-md','gv-me','gv-ng','gv-pl','gv-pt','gv-ro','gv-rs','gv-tn',
+        'gv-ua','gv-ug'
+      )
+      AND o.order_status = 'completed'
+      AND o.vertical_type = 'restaurants'
+  ),
+  northstar_combined AS (
+    SELECT
+      TRIM(CAST(v.order_id AS STRING)) AS join_key,
+      LOWER(v.country_code) AS ns_country_2letter,
+      v.dispatch_to_pickup_time_minutes,
+      v.wait_time_pickup_minutes AS at_vendor_time_minutes,
+      v.to_customer_time_minutes
+    FROM `fulfillment-dwh-production.curated_data_shared_glovo.vendor_northstar_metrics_order_level_join__order_level_northstar_metrics_join` AS v
+    WHERE v.region IS NOT NULL
+      AND v.p_created_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+      AND v.p_created_date <  DATE_ADD(CURRENT_DATE(), INTERVAL 1 DAY)
+      AND LOWER(v.country_code) IN (
+        'am','ba','bg','ci','es','ge','hr','it','ke','kg','kz','ma','md','me','ng',
+        'pl','pt','ro','rs','tn','ua','ug'
+      )
+  )
+  SELECT
+    b.order_id,
+    b.country_code,
+    b.delivery_time_minutes,
+    b.is_dt60,
+    nc.dispatch_to_pickup_time_minutes,
+    nc.at_vendor_time_minutes,
+    nc.to_customer_time_minutes
+  FROM orders_base AS b
+  LEFT JOIN northstar_combined AS nc
+    ON nc.join_key = CAST(b.order_id AS STRING)
+   AND nc.ns_country_2letter = REPLACE(b.country_code, 'gv-', '')
+);
+
+CREATE TEMP TABLE country_stats_2025_full AS (
+  WITH orders_base_2025 AS (
+    SELECT
+      o.global_order_id AS order_id,
+      LOWER(o.country_code) AS country_code,
+      CASE
+        WHEN o.is_preorder = TRUE
+          THEN TIMESTAMP_DIFF(TIMESTAMP(o.rider_dropped_off_at), TIMESTAMP(o.order_queued_at), MINUTE)
+        ELSE (o.actual_delivery_time_in_seconds + COALESCE(o.at_customer_time_in_seconds, 0)) / 60.00
+      END AS delivery_time_minutes,
+      CASE
+        WHEN (
+          CASE
+            WHEN o.is_preorder = TRUE
+              THEN TIMESTAMP_DIFF(TIMESTAMP(o.rider_dropped_off_at), TIMESTAMP(o.order_queued_at), MINUTE)
+            ELSE (o.actual_delivery_time_in_seconds + COALESCE(o.at_customer_time_in_seconds, 0)) / 60.00
+          END > 60
+        ) AND o.vertical_type = 'restaurants' THEN 1
+        ELSE 0
+      END AS is_dt60
+    FROM `fulfillment-dwh-production.curated_data_shared_glovo.logistics_orders__orders` AS o
+    WHERE DATE(o.order_created_at) >= DATE('2025-01-01')
+      AND DATE(o.order_created_at) <  DATE('2026-01-01')
+      AND LOWER(o.country_code) IN (
+        'gv-am','gv-ba','gv-bg','gv-ci','gv-es','gv-ge','gv-hr','gv-it','gv-ke','gv-kg',
+        'gv-kz','gv-ma','gv-md','gv-me','gv-ng','gv-pl','gv-pt','gv-ro','gv-rs','gv-tn',
+        'gv-ua','gv-ug'
+      )
+      AND o.order_status = 'completed'
+      AND o.vertical_type = 'restaurants'
+  ),
+  northstar_2025 AS (
+    SELECT
+      TRIM(CAST(v.order_id AS STRING)) AS join_key,
+      LOWER(v.country_code) AS ns_country_2letter,
+      v.dispatch_to_pickup_time_minutes,
+      v.wait_time_pickup_minutes AS at_vendor_time_minutes,
+      v.to_customer_time_minutes
+    FROM `fulfillment-dwh-production.curated_data_shared_glovo.vendor_northstar_metrics_order_level_join__order_level_northstar_metrics_join` AS v
+    WHERE v.region IS NOT NULL
+      AND v.p_created_date >= DATE('2025-01-01')
+      AND v.p_created_date <  DATE('2026-01-01')
+      AND LOWER(v.country_code) IN (
+        'am','ba','bg','ci','es','ge','hr','it','ke','kg','kz','ma','md','me','ng',
+        'pl','pt','ro','rs','tn','ua','ug'
+      )
+  ),
+  joined_2025 AS (
+    SELECT
+      b.country_code,
+      b.is_dt60,
+      nc.dispatch_to_pickup_time_minutes,
+      nc.at_vendor_time_minutes,
+      nc.to_customer_time_minutes
+    FROM orders_base_2025 AS b
+    LEFT JOIN northstar_2025 AS nc
+      ON nc.join_key = CAST(b.order_id AS STRING)
+     AND nc.ns_country_2letter = REPLACE(b.country_code, 'gv-', '')
+  )
+  SELECT
+    country_code,
+    COUNT(*) AS total_orders_2025,
+    AVG(dispatch_to_pickup_time_minutes) AS avg_2025_dispatch_to_pu,
+    AVG(at_vendor_time_minutes) AS avg_2025_at_vendor,
+    AVG(to_customer_time_minutes) AS avg_2025_to_customer,
+    SAFE_DIVIDE(COUNTIF(is_dt60 = 1), COUNT(*)) * 100.0 AS dt60_2025_actual_pct
+  FROM joined_2025
+  GROUP BY country_code
+);
+
+CREATE TEMP TABLE country_stats_current_r30d AS (
+  SELECT
+    country_code,
+    COUNT(*) AS total_orders,
+    AVG(delivery_time_minutes) AS current_mean_minutes,
+    AVG(dispatch_to_pickup_time_minutes) AS avg_2026_dispatch_to_pu,
+    AVG(at_vendor_time_minutes) AS avg_2026_at_vendor,
+    AVG(to_customer_time_minutes) AS avg_2026_to_customer,
+    SAFE_DIVIDE(COUNTIF(is_dt60 = 1), COUNT(*)) * 100.0 AS dt60_actual_pct
+  FROM order_level_current_r30d
+  GROUP BY country_code
+);
+
+WITH slips AS (
+  SELECT
+    c.country_code,
+    c.total_orders,
+    c.current_mean_minutes,
+    c.dt60_actual_pct,
+    GREATEST(c.avg_2026_dispatch_to_pu - b.avg_2025_dispatch_to_pu, 0) AS slip_dispatch_to_pu,
+    GREATEST(c.avg_2026_at_vendor - b.avg_2025_at_vendor, 0) AS slip_at_vendor,
+    GREATEST(c.avg_2026_to_customer - b.avg_2025_to_customer, 0) AS slip_to_customer,
+    b.dt60_2025_actual_pct,
+    b.total_orders_2025
+  FROM country_stats_current_r30d c
+  JOIN country_stats_2025_full b ON b.country_code = c.country_code
+),
+
+ratios AS (
+  SELECT
+    *,
+    (slip_dispatch_to_pu + slip_at_vendor + slip_to_customer) AS total_slip_minutes,
+    current_mean_minutes - (slip_dispatch_to_pu + slip_at_vendor + slip_to_customer) AS reverted_mean_minutes
+  FROM slips
+),
+
+ratios2 AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(reverted_mean_minutes, current_mean_minutes) AS scaling_ratio,
+    SAFE_DIVIDE(60.0, SAFE_DIVIDE(reverted_mean_minutes, current_mean_minutes)) AS effective_threshold_minutes
+  FROM ratios
+),
+
+flagged AS (
+  SELECT
+    e.country_code,
+    (r2.effective_threshold_minutes IS NOT NULL AND e.delivery_time_minutes > r2.effective_threshold_minutes) AS is_above_threshold
+  FROM order_level_current_r30d e
+  JOIN ratios2 r2 ON r2.country_code = e.country_code
+),
+
+raw_reverted AS (
+  SELECT
+    country_code,
+    SAFE_DIVIDE(COUNTIF(is_above_threshold), COUNT(*)) * 100.0 AS raw_reverted_dt60_pct
+  FROM flagged
+  GROUP BY country_code
+)
+
+SELECT
+  r2.country_code,
+  r2.total_orders,
+  ROUND(r2.current_mean_minutes, 2) AS current_mean_minutes,
+  ROUND(r2.slip_dispatch_to_pu, 2) AS slip_dispatch_to_pu_min,
+  ROUND(r2.slip_at_vendor, 2) AS slip_at_vendor_min,
+  ROUND(r2.slip_to_customer, 2) AS slip_to_customer_min,
+  ROUND(r2.total_slip_minutes, 2) AS total_slip_minutes,
+  ROUND(r2.reverted_mean_minutes, 2) AS reverted_mean_minutes,
+  ROUND(r2.scaling_ratio, 4) AS scaling_ratio,
+  ROUND(r2.effective_threshold_minutes, 2) AS effective_threshold_minutes,
+  ROUND(r2.dt60_actual_pct, 2) AS dt60_actual_pct,
+  ROUND(r2.dt60_2025_actual_pct, 2) AS dt60_2025_actual_pct,
+  ROUND(rr.raw_reverted_dt60_pct, 2) AS raw_reverted_dt60_pct,
+  ROUND(GREATEST(rr.raw_reverted_dt60_pct, r2.dt60_2025_actual_pct), 2) AS reverted_target_dt60_pct
+FROM ratios2 r2
+JOIN raw_reverted rr ON rr.country_code = r2.country_code
+
+UNION ALL
+
+SELECT
+  'GLOBAL' AS country_code,
+  SUM(r2.total_orders) AS total_orders,
+  CAST(NULL AS FLOAT64) AS current_mean_minutes,
+  CAST(NULL AS FLOAT64) AS slip_dispatch_to_pu_min,
+  CAST(NULL AS FLOAT64) AS slip_at_vendor_min,
+  CAST(NULL AS FLOAT64) AS slip_to_customer_min,
+  CAST(NULL AS FLOAT64) AS total_slip_minutes,
+  CAST(NULL AS FLOAT64) AS reverted_mean_minutes,
+  CAST(NULL AS FLOAT64) AS scaling_ratio,
+  CAST(NULL AS FLOAT64) AS effective_threshold_minutes,
+  -- Weighted by each country's CURRENT (last-30-days) order count -- these
+  -- three rates are all measured over that same current-window population.
+  SAFE_DIVIDE(SUM(r2.total_orders * r2.dt60_actual_pct / 100.0), SUM(r2.total_orders)) * 100.0 AS dt60_actual_pct,
+  -- Weighted by each country's 2025 order count instead -- this rate is
+  -- measured over the full-year-2025 population, a different N per
+  -- country than the current window, so it needs its own weight to
+  -- reconstruct the true pooled 2025 GLOBAL rate rather than a mismatched
+  -- (2025 rate) x (2026 volume) blend.
+  SAFE_DIVIDE(SUM(r2.total_orders_2025 * r2.dt60_2025_actual_pct / 100.0), SUM(r2.total_orders_2025)) * 100.0 AS dt60_2025_actual_pct,
+  SAFE_DIVIDE(SUM(r2.total_orders * rr.raw_reverted_dt60_pct / 100.0), SUM(r2.total_orders)) * 100.0 AS raw_reverted_dt60_pct,
+  GREATEST(
+    SAFE_DIVIDE(SUM(r2.total_orders * rr.raw_reverted_dt60_pct / 100.0), SUM(r2.total_orders)) * 100.0,
+    SAFE_DIVIDE(SUM(r2.total_orders_2025 * r2.dt60_2025_actual_pct / 100.0), SUM(r2.total_orders_2025)) * 100.0
+  ) AS reverted_target_dt60_pct
+FROM ratios2 r2
+JOIN raw_reverted rr ON rr.country_code = r2.country_code
+
+ORDER BY country_code;

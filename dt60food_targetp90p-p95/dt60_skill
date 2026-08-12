@@ -1,0 +1,206 @@
+---
+name: dt60-analysis
+description: Use whenever the user asks about DT60 (Glovo's % of orders where delivery time exceeds 60 minutes), delivery-time target-setting, or which delivery levers (dispatch-to-pickup, waiting at dropoff, distance, speed pace, reassignment rate) drive late orders. Trigger even without the words "DT60" -- e.g. reducing late-delivery rates, finding delivery outliers, setting per-country/city delivery targets, "what would on-time rate look like if we fixed the worst N%", or YoY delivery comparisons. Also use when rerunning/iterating a prior DT60 query ("run this for Q3", "add 2027", "redo at city grain", "same but per lever", "same but P95") -- this skill's query template and lever definitions are the known-good starting point, not something to rebuild from scratch.
+---
+
+# DT60 delivery-time target-setting
+
+DT60 is Glovo's headline lateness metric: the percentage of completed restaurant
+orders where the time from order placed to dropped off exceeds 60 minutes. This
+skill captures a working, verified methodology for turning DT60 into per-country
+(or per-city) improvement targets, plus the BigQuery schema knowledge and
+performance fixes that took real trial-and-error to discover. Read
+`references/schema_and_gotchas.md` before writing or editing any query -- it will
+save you from re-discovering a dead join and a 45-minute runaway query the hard
+way.
+
+## The core method: flag-once union
+
+The central technique is **flag-once, not sum**. Instead of estimating "how much
+would DT60 improve if we shaved N minutes off each lever" (which double-counts
+overlapping orders), flag each order **once** if it exceeds its own country's own
+year's worst-tail threshold on **any** of the levers, then **measure** DT60
+directly on the flagged group vs. the rest. This is a measured result, not an
+estimate, and it can never overstate impact the way naively summing per-lever
+deltas would.
+
+1. For each lever, compute the P90 (or P95) threshold **per country per year**
+   (never a single global or cross-year threshold -- delivery norms differ by
+   market and time).
+2. Flag an order if it exceeds **any** lever's own threshold (the "union").
+3. Compute DT60 separately on the flagged tail and the clean remainder. The
+   clean remainder's DT60 rate is the **target** -- "what DT60 would look like
+   if every outlier-flagged order behaved like a typical order."
+
+**Always sanity-check with the reconciliation identity** (see
+`references/verification_checklist.md`):
+
+```
+dt60_overall = pct_flagged × dt60_in_tail + (1 − pct_flagged) × dt60_if_removed
+```
+
+If this doesn't hold to within rounding, something in the query is wrong --
+don't trust the target number until it reconciles.
+
+## Why the flagged share isn't 10% (or 5%)
+
+A common point of confusion: if each lever's P90 threshold flags exactly 10% of
+orders by definition, why does the union across 5 levers flag ~32% of orders,
+not 10%? Because the levers only partially overlap -- an order that's slow on
+dispatch isn't necessarily the same order that's far away. The union of K
+independently-10%-flagging levers ranges from 10% (if it's always the exact same
+orders failing every lever) up to 1 − 0.9^K (if which orders fail which lever is
+totally unrelated). Real data tends to land closer to the independence end,
+which is why 5 levers at P90 lands around 30-33% flagged, and P95 (worst 5% per
+lever) lands around 16-18%. This is expected, not a bug -- explain it this way
+if the user pushes back on "why is so much flagged."
+
+## Two thresholds, two targets: P90 vs P95
+
+Always worth computing **both** side by side rather than picking one:
+
+- **P90** (worst 10% per lever): the more aggressive target, flags more orders,
+  bigger DT60 drop, but touches a larger slice of volume.
+- **P95** (worst 5% per lever): the more conservative target, flags fewer
+  orders, smaller DT60 drop, but a more realistic slice to actually go fix.
+
+## Single-offender vs. multi-offender
+
+The default union method flags an order if it's bad on **any 1** lever. This
+tends to flag a large share of orders because most levers only weakly overlap.
+If the user wants a stricter, more defensible target -- "only count orders that
+are bad on 2+ dimensions at once, not orders having one bad metric" -- switch
+the flag condition from `n_reasons >= 1` to `n_reasons >= 2` (count how many of
+the 5 levers each order exceeds, then threshold on that count instead of a
+simple OR). This shrinks the flagged share sharply (in one real run, P90 dropped
+from ~32% to ~9%) and produces a target for "genuinely multi-symptom" orders
+only. Report `avg_n_reasons` too -- a low average (well under 1) confirms most
+orders are only bad on at most one dimension, which is exactly why requiring 2+
+filters out so much.
+
+Both the single- and multi-offender versions can also be broken out **per
+lever** instead of as one combined union -- see `references/query_template.sql`
+for both the union and per-lever query shapes.
+
+## The levers
+
+| Lever | What it measures | Formula (see schema doc for exact tables/columns) | Status |
+|---|---|---|---|
+| `dispatch_to_pu` | Time from order ready to courier dispatched | `dispatch_to_pickup_time_minutes` from vendor_northstar | Active |
+| `waiting_at_dropoff` | Courier's wait time at the vendor | `wait_time_pickup_minutes` from vendor_northstar | Active |
+| `sp_distance` | Pickup distance (restaurant to courier start) | `pickup_distance_flight_in_meters` | Active |
+| `speed_pace` | Courier's pace to the customer | `to_customer_time_minutes` (vendor_northstar) ÷ `dropoff_distance_flight_in_meters/1000`, only when distance ≥ 100m | Active |
+| `rr_pct` | Reassignment rate (courier drop/reassign) | Requires a window-function join over `deliveries`/`transitions` arrays | Active -- see gotchas for a bug that used to make this a zero-signal placeholder |
+
+**Excluded on purpose** (don't add these back without asking why first):
+`ready_to_pickup` and `dropoff_distance` are treated as non-actionable (assumed
+not going to improve), though `dropoff_distance` is still used internally to
+compute `speed_pace`. `estimated_prep_time`, `accept_to_ready`,
+`dispatch_to_ready`, `reassignments`, and `total_dt` are excluded because
+they're either not independently actionable or **circular** with DT60 itself --
+a "lever" built directly from delivery time (like the original,
+now-superseded `speed_pace = delivery_time / distance`) shares its numerator
+with the very thing DT60 measures, so flagging its worst decile partially
+re-captures "was this order just slow overall" through the back door. This is
+why `speed_pace` is defined off `to_customer_time_minutes` (a distinct
+northstar-tracked signal), not delivery time.
+
+## Before running anything: read the gotchas doc
+
+`references/schema_and_gotchas.md` has the exact table/column names, the
+country-code mapping between Glovo's internal codes and vendor_northstar's
+codes, the timezone rule (only Italy gets a local-timezone date bucket), and
+three real, previously-hit performance/correctness landmines:
+
+1. A join to the zone-stats table that looks necessary but contributes zero
+   columns to the output (dead weight, cut it).
+2. `rr_pct`'s reassignments computation requires a double `UNNEST` plus a
+   windowed `LEAD()` -- the most expensive shape BigQuery can run. An earlier
+   version also had a real logic bug (see below) that made it return zero
+   signal everywhere; that's now fixed, so this lever is active, but it's
+   still the single biggest cost driver in the whole query -- if a query
+   using it takes 30-45+ minutes, this is the first thing to suspect, not
+   proof it's broken again.
+3. Three CTEs independently re-scanning the same base orders table with
+   identical filters -- merge them into one pass.
+
+**The rr_pct bug, in full, in case it resurfaces**: the original reassignments
+CTE filtered `WHERE tr.state = 'courier_notified'` *before* the `LEAD()`
+window function ran. SQL applies `WHERE` before SELECT-level window
+functions, so `LEAD()` was only ever evaluated over rows that had *already*
+been filtered down to `courier_notified` -- meaning it could only ever see
+*other* `courier_notified` rows as "next," never the actual subsequent
+`queued`/`dispatched` transition that would indicate a reassignment. The
+result: `is_reassignment` was structurally guaranteed to always be `false`,
+`rr_pct` was 0 or NULL for every order, and its P90/P95 threshold came back
+completely blank across every country-year, every year, every run. The fix:
+compute `next_state` over the full relevant-state sequence first (don't
+filter down yet), and filter to `courier_notified` only *after* `next_state`
+is already computed:
+
+```sql
+transitions AS (
+  SELECT
+    o.global_order_id AS order_id, LOWER(o.country_code) AS country_code,
+    del.id AS delivery_id, tr.state,
+    LEAD(tr.state) OVER (PARTITION BY o.country_code, del.id ORDER BY tr.created_at ASC) AS next_state
+  FROM `fulfillment-dwh-production.curated_data_shared.orders` AS o
+  LEFT JOIN UNNEST(deliveries) AS del
+  LEFT JOIN UNNEST(del.transitions) AS tr
+  WHERE created_date >= DATE(...) AND created_date < DATE(...)
+    AND LOWER(o.country_code) IN (...)
+    AND tr.state IN ('cancelled', 'scheduled', 'queued', 'dispatched', 'courier_notified')
+),
+reassignments AS (
+  SELECT order_id, country_code,
+    COUNT(delivery_id) AS total_couriers_notified,
+    COUNTIF(next_state IN ('queued', 'dispatched')) AS total_reassignments
+  FROM transitions
+  WHERE state = 'courier_notified'
+  GROUP BY order_id, country_code
+)
+```
+
+Verified against real production data after this fix: 100% join hit rate
+against the base orders table (so there was never a cross-dataset join-key
+mismatch, despite `reassignments` sourcing from a different top-level
+dataset, `curated_data_shared`, than everything else, which uses
+`curated_data_shared_glovo` -- that was a reasonable thing to suspect and
+check, it just wasn't the actual cause here), and a real, sensible
+distribution: median RR is 0 (most orders never get reassigned), ~16% of
+orders have at least one reassignment, and the worst 10% of orders sit at
+50%+ reassignment rate.
+
+If a query using it takes 30-45+ minutes, check landmines #1 and #3 before
+assuming the fix has regressed -- narrowing the date range is also a
+legitimate first lever, not just a fallback.
+
+## Reference files
+
+- `references/schema_and_gotchas.md` -- exact BigQuery table/column names,
+  country-code mappings, timezone handling, and the three performance
+  landmines above, explained in full.
+- `references/query_template.sql` -- a ready-to-adapt BigQuery template
+  implementing the flag-once union (single- and multi-offender, P90 and P95
+  side by side) at country grain, with a GLOBAL rollup row. Copy this rather
+  than writing a query from scratch; change the date range, country list, or
+  lever set as needed.
+- `references/verification_checklist.md` -- the reconciliation checks to run
+  on every result CSV before trusting it or building a deliverable from it
+  (sum-of-parts-equals-rollup, and the tail/floor identity), with a runnable
+  Python snippet.
+
+## Building the target workbook
+
+Once a query result CSV comes back, build country-level target tables in
+`.xlsx` following the `xlsx` skill's conventions (openpyxl, real formulas not
+hardcoded values, Arial font). Sort by improvement potential (actual DT60 minus
+target DT60) descending so the biggest opportunities surface first. If you're
+in a sandboxed environment where LibreOffice recalculation is too slow to
+finish before a tool-call timeout, don't fight it repeatedly -- write the
+formula's already-known result directly into the cell's cached `<v>` value
+alongside the `<f>` formula (standard OOXML: real Excel files always carry
+both), verified by reloading with `data_only=True` and checking the cached
+value matches a from-scratch recomputation. This gives you a file that opens
+correctly in Excel/LibreOffice/Numbers with live formulas, without needing a
+working LibreOffice recalc pass in this session.
